@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# makepkg working directories and output
+/src/
+/pkg/
+*.pkg.tar.*

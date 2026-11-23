@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Stand-in for resolvectl, passed to forcepoint-client as --resolver so the
+# DNS servers and search domains it receives go to NetworkManager instead of
+# being written to systemd-resolved behind NetworkManager's back.
+exec "$(dirname "$0")/nm-forcepoint-hook" resolver "$@"

@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""NetworkManager VPN service for Forcepoint NGFW SSL VPN.
+
+NetworkManager starts this program (as root) when a connection of type
+``vpn`` with ``vpn-type forcepoint`` is activated. It runs Forcepoint's own
+``forcepoint-client`` binary, learns the tunnel it created through the
+client's --establishedcmd / --resolver hooks, and reports the tunnel device,
+addresses, routes and DNS back to NetworkManager.
+
+Not affiliated with or endorsed by Forcepoint.
+"""
+
+import argparse
+import ipaddress
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+import gi
+
+gi.require_version("NM", "1.0")
+from gi.repository import GLib, NM  # noqa: E402
+
+SERVICE_NAME = "org.freedesktop.NetworkManager.forcepoint"
+LIBEXEC_DIR = os.path.dirname(os.path.realpath(__file__))
+HOOK = os.path.join(LIBEXEC_DIR, "nm-forcepoint-hook")
+RESOLVER_SHIM = os.path.join(LIBEXEC_DIR, "resolvectl")
+
+# Where Forcepoint's client may be installed: the Debian package puts it in
+# /usr/sbin; the Arch AUR package (forcepoint-client-bin) renames the real
+# binary to /usr/bin/_forcepoint-client and ships an old libevent_openssl in
+# /usr/lib/forcepoint-client that it needs on LD_LIBRARY_PATH.
+CLIENT_CANDIDATES = (
+    ("/usr/bin/_forcepoint-client", "/usr/lib/forcepoint-client"),
+    ("/usr/sbin/forcepoint-client", None),
+    ("/usr/bin/forcepoint-client", None),
+)
+
+DISCONNECT_GRACE_S = 8
+ESTABLISH_SETTLE_MS = 700
+
+log = logging.getLogger("nm-forcepoint")
+
+
+class ConfigError(Exception):
+    """A connection setting is missing or invalid."""
+
+
+# --------------------------------------------------------------------------
+# Pure helpers (unit tested in tests/test_service.py)
+# --------------------------------------------------------------------------
+
+def parse_options(data, secrets):
+    """Validate the vpn.data / vpn.secrets dictionaries of a connection."""
+    opts = {}
+    config = (data.get("config") or "").strip()
+    gateway = (data.get("gateway") or "").strip()
+    if not config and not gateway:
+        raise ConfigError("set either 'gateway' or 'config' in vpn.data")
+    if config and not os.path.isfile(config):
+        raise ConfigError(f"config file {config!r} does not exist")
+    opts["config"] = config or None
+
+    port_s = (data.get("port") or "").strip()
+    if config and not gateway:
+        host, xml_port = peer_from_config(config)
+        gateway = host
+        port_s = port_s or (str(xml_port) if xml_port else "")
+    opts["gateway"] = gateway
+    try:
+        port = int(port_s or "443")
+    except ValueError:
+        raise ConfigError(f"port {port_s!r} is not a number") from None
+    if not 0 < port < 65536:
+        raise ConfigError(f"port {port} is out of range")
+    opts["port"] = port
+
+    user = (data.get("user") or "").strip()
+    if not user:
+        raise ConfigError("set 'user' in vpn.data")
+    opts["user"] = user
+
+    password = secrets.get("password") or ""
+    if not password:
+        raise ConfigError(
+            "no password stored; save it with password-flags=0 "
+            "(nm-connection-editor: 'Store the password for all users')")
+    opts["password"] = password
+
+    opts["client"] = (data.get("client") or "").strip() or None
+    opts["library_path"] = (data.get("library-path") or "").strip() or None
+    opts["dns"] = (data.get("dns") or "yes").strip().lower() not in ("no", "false", "0")
+    return opts
+
+
+def peer_from_config(path):
+    """Return (host, port) of the first ssl-peer in a client XML config."""
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ConfigError(f"cannot read config {path!r}: {exc}") from None
+    peer = root.find(".//ssl-peer")
+    if peer is None or not (peer.text or peer.get("id")):
+        raise ConfigError(f"no ssl-peer found in {path!r}")
+    host = (peer.text or peer.get("id")).strip()
+    port = peer.get("port")
+    return host, int(port) if port and port.isdigit() else None
+
+
+def find_client(opts):
+    """Return (binary, library_dir or None) for forcepoint-client."""
+    if opts.get("client"):
+        if not os.access(opts["client"], os.X_OK):
+            raise ConfigError(f"client {opts['client']!r} is not executable")
+        return opts["client"], opts.get("library_path")
+    for binary, libdir in CLIENT_CANDIDATES:
+        if os.access(binary, os.X_OK):
+            if libdir and not os.path.isdir(libdir):
+                libdir = None
+            return binary, opts.get("library_path") or libdir
+    raise ConfigError("forcepoint-client is not installed")
+
+
+def build_argv(binary, opts):
+    """Command line for forcepoint-client. The password never appears in it."""
+    argv = [
+        binary,
+        "--nostamp",
+        "--user", opts["user"],
+        "--passcmd", "printenv NM_FORCEPOINT_PASSWORD",
+        "--establishedcmd", f"{HOOK} established",
+        "--disconnectedcmd", f"{HOOK} disconnected",
+        "--resolver", RESOLVER_SHIM if opts["dns"] else "none",
+    ]
+    if opts["config"]:
+        argv += ["--config", opts["config"]]
+    else:
+        argv += ["--port", str(opts["port"]), opts["gateway"]]
+    return argv
+
+
+def ip4_u32(addr):
+    """IPv4 address as the network-byte-order uint32 NetworkManager expects."""
+    return struct.unpack("=I", socket.inet_aton(str(addr)))[0]
+
+
+def resolve_ipv4(host):
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    return infos[0][4][0]
+
+
+def parse_event(line):
+    """Parse one line written by the hook / resolver shim."""
+    words = line.split()
+    if not words:
+        return None
+    kind = words[0]
+    if kind in ("established", "disconnected"):
+        return (kind,)
+    if kind == "resolver" and len(words) >= 3:
+        verb, dev, args = words[1], words[2], words[3:]
+        if verb == "dns":
+            servers = []
+            for a in args:
+                try:
+                    servers.append(str(ipaddress.ip_address(a.split("%")[0].split("#")[0])))
+                except ValueError:
+                    continue
+            return ("dns", dev, servers)
+        if verb == "domain":
+            return ("domain", dev, [a.lstrip("~") for a in args if a.strip("~")])
+        return ("resolver-other", verb, dev)
+    return ("unknown", line)
+
+
+def tun_device_of(pid):
+    """Name of the TUN interface a process holds open, from /proc fdinfo."""
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        fds = os.listdir(fd_dir)
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if os.readlink(os.path.join(fd_dir, fd)) != "/dev/net/tun":
+                continue
+            with open(f"/proc/{pid}/fdinfo/{fd}") as fh:
+                for line in fh:
+                    if line.startswith("iff:"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            continue
+    return None
+
+
+def ip_json(*args):
+    out = subprocess.run(["ip", "-j", *args], check=True, capture_output=True, text=True).stdout
+    return json.loads(out or "[]")
+
+
+def build_ip4_config(addr_info, routes, dns, domains):
+    """Turn `ip -j` output plus resolver data into NetworkManager's ip4 dict.
+
+    addr_info: list of {"local": str, "prefixlen": int, "address": peer?}
+    routes:    list of `ip -j route` objects for the tunnel device
+    """
+    v4 = [a for a in addr_info if a.get("family", "inet") == "inet"]
+    if not v4:
+        raise ConfigError("the tunnel has no IPv4 address")
+    local = v4[0]
+    cfg = {
+        NM.VPN_PLUGIN_IP4_CONFIG_ADDRESS: GLib.Variant("u", ip4_u32(local["local"])),
+        NM.VPN_PLUGIN_IP4_CONFIG_PREFIX: GLib.Variant("u", int(local.get("prefixlen", 32))),
+    }
+    peer = local.get("address")
+    if peer and peer != local["local"]:
+        cfg[NM.VPN_PLUGIN_IP4_CONFIG_PTP] = GLib.Variant("u", ip4_u32(peer))
+
+    nm_routes, full_tunnel = [], False
+    for r in routes:
+        if r.get("protocol") == "kernel" or r.get("type", "unicast") != "unicast":
+            continue
+        dst = r.get("dst", "")
+        if dst == "default":
+            full_tunnel = True
+            if r.get("gateway"):
+                cfg[NM.VPN_PLUGIN_IP4_CONFIG_INT_GATEWAY] = GLib.Variant("u", ip4_u32(r["gateway"]))
+            continue
+        net = ipaddress.IPv4Network(dst if "/" in dst else dst + "/32", strict=False)
+        nh = ip4_u32(r["gateway"]) if r.get("gateway") else 0
+        nm_routes.append([ip4_u32(net.network_address), net.prefixlen, nh, int(r.get("metric", 0))])
+    if nm_routes:
+        cfg[NM.VPN_PLUGIN_IP4_CONFIG_ROUTES] = GLib.Variant("aau", nm_routes)
+    cfg[NM.VPN_PLUGIN_IP4_CONFIG_NEVER_DEFAULT] = GLib.Variant("b", not full_tunnel)
+
+    dns4 = [d for d in dns if ipaddress.ip_address(d).version == 4]
+    if dns4:
+        cfg[NM.VPN_PLUGIN_IP4_CONFIG_DNS] = GLib.Variant("au", [ip4_u32(d) for d in dns4])
+    if domains:
+        cfg[NM.VPN_PLUGIN_IP4_CONFIG_DOMAINS] = GLib.Variant("as", list(domains))
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# The service
+# --------------------------------------------------------------------------
+
+class ForcepointPlugin(NM.VpnServicePlugin):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._reset()
+
+    def _reset(self):
+        self.pid = None
+        self.rundir = None
+        self.fds = []
+        self.bufs = {}
+        self.watches = {}
+        self.stopping = False
+        self.established = False
+        self.tundev = None
+        self.dns = []
+        self.domains = []
+        self.ext_gateway = None
+        self.last_error = None
+        self.cert_prompt_seen = False
+
+    # -- NM.VpnServicePlugin vfuncs ------------------------------------------
+
+    def do_need_secrets(self, connection, setting_name):
+        # libnm's introspection exposes setting_name as an input, so a Python
+        # plugin cannot ask NetworkManager for secrets here; a missing
+        # password is reported by do_connect instead.
+        return False
+
+    def do_connect(self, connection):
+        if self.pid is not None:
+            raise GLib.Error("a connection is already active", NM.VpnPluginError.quark(),
+                             NM.VpnPluginError.ALREADY_STARTED)
+        s_vpn = connection.get_setting_vpn()
+        data = {k: s_vpn.get_data_item(k) for k in s_vpn.get_data_keys()}
+        secrets = {k: s_vpn.get_secret(k) for k in s_vpn.get_secret_keys()}
+        try:
+            opts = parse_options(data, secrets)
+            binary, libdir = find_client(opts)
+            self.ext_gateway = resolve_ipv4(opts["gateway"])
+        except (ConfigError, OSError) as exc:
+            log.error("connection settings: %s", exc)
+            raise GLib.Error(str(exc), NM.VpnPluginError.quark(),
+                             NM.VpnPluginError.BAD_ARGUMENTS) from None
+
+        self.rundir = tempfile.mkdtemp(prefix="nm-forcepoint-", dir="/run")
+        fifo = os.path.join(self.rundir, "events")
+        os.mkfifo(fifo, 0o600)
+        # O_RDWR keeps a writer open so the reader never sees EOF.
+        fifo_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.fds.append(fifo_fd)
+        self._watch(fifo_fd, GLib.IO_IN, self._on_event)
+
+        env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+            "LANG": "C.UTF-8",
+            "NM_FORCEPOINT_EVENTS": fifo,
+            "NM_FORCEPOINT_PASSWORD": opts["password"],
+        }
+        if libdir:
+            env["LD_LIBRARY_PATH"] = libdir
+        argv = build_argv(binary, opts)
+        log.info("starting %s for %s:%s as %s", binary, opts["gateway"], opts["port"], opts["user"])
+        try:
+            pid, _, out_fd, err_fd = GLib.spawn_async(
+                argv, envp=[f"{k}={v}" for k, v in env.items()],
+                flags=GLib.SpawnFlags.DO_NOT_REAP_CHILD | GLib.SpawnFlags.STDIN_FROM_DEV_NULL,
+                standard_output=True, standard_error=True)
+        except GLib.Error as exc:
+            self._cleanup()
+            raise GLib.Error(f"cannot start forcepoint-client: {exc.message}",
+                             NM.VpnPluginError.quark(), NM.VpnPluginError.LAUNCH_FAILED) from None
+        self.pid = pid
+        for fd in (out_fd, err_fd):
+            os.set_blocking(fd, False)
+            self.fds.append(fd)
+            self.bufs[fd] = b""
+            self._watch(fd, GLib.IO_IN | GLib.IO_HUP, self._on_output)
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, self._on_exit)
+        return True
+
+    def do_disconnect(self):
+        if self.pid is None:
+            return True
+        self.stopping = True
+        log.info("disconnecting")
+        self._signal(signal.SIGINT)
+        pid = self.pid
+        GLib.timeout_add_seconds(DISCONNECT_GRACE_S, self._force_kill, pid)
+        return True
+
+    # -- client process --------------------------------------------------------
+
+    def _watch(self, fd, cond, callback):
+        def wrapper(fd, cond):
+            keep = callback(fd, cond)
+            if not keep:
+                self.watches.pop(fd, None)
+            return keep
+        self.watches[fd] = GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, cond, wrapper)
+
+    def shutdown_sync(self):
+        """Stop the client and wait for it; used when the service itself exits."""
+        if self.pid is None:
+            return
+        pid, self.stopping = self.pid, True
+        self._signal(signal.SIGINT)
+        for _ in range(DISCONNECT_GRACE_S * 10):
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+            except ChildProcessError:
+                break
+            GLib.usleep(100_000)
+        else:
+            self._signal(signal.SIGKILL)
+        self._cleanup()
+
+    def _signal(self, sig):
+        try:
+            os.kill(self.pid, sig)
+        except (ProcessLookupError, TypeError):
+            pass
+
+    def _force_kill(self, pid):
+        if self.pid == pid:
+            log.warning("client did not exit after %ss; killing it", DISCONNECT_GRACE_S)
+            self._signal(signal.SIGKILL)
+        return False
+
+    def _on_output(self, fd, cond):
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            chunk = b""
+        if not chunk:
+            return False
+        buf = self.bufs.get(fd, b"") + chunk
+        *lines, self.bufs[fd] = buf.split(b"\n")
+        for raw in lines:
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            if "accept the certificate" in line:
+                self.cert_prompt_seen = True
+            if re.search(r"(?i)\b(error|failed|denied|invalid)\b", line):
+                self.last_error = line
+            log.info("client: %s", line)
+        return True
+
+    def _on_exit(self, pid, status):
+        GLib.spawn_close_pid(pid)
+        try:
+            code = os.waitstatus_to_exitcode(status)
+        except ValueError:
+            code = status
+        was_established, stopping = self.established, self.stopping
+        log.info("client exited (status %s)", code)
+        self._cleanup()
+        if stopping:
+            return
+        if not was_established:
+            if self.cert_prompt_seen:
+                log.error("the gateway certificate is not trusted yet: connect once with "
+                          "forcepoint-client in a terminal, then set config= to the saved XML")
+            elif self.last_error:
+                log.error("connection failed: %s", self.last_error)
+            self.failure(NM.VpnPluginFailure.CONNECT_FAILED)
+        self.disconnect()
+
+    # -- hook events -----------------------------------------------------------
+
+    def _on_event(self, fd, cond):
+        try:
+            data = os.read(fd, 65536).decode("utf-8", "replace")
+        except BlockingIOError:
+            return True
+        for line in data.splitlines():
+            ev = parse_event(line)
+            if not ev:
+                continue
+            log.debug("event %s", ev)
+            if ev[0] == "dns":
+                self.tundev = self.tundev or ev[1]
+                self.dns = ev[2]
+            elif ev[0] == "domain":
+                self.domains = ev[2]
+            elif ev[0] == "established" and not self.established:
+                GLib.timeout_add(ESTABLISH_SETTLE_MS, self._report_config)
+            elif ev[0] == "established":
+                log.info("tunnel re-established")
+            elif ev[0] == "disconnected" and not self.stopping:
+                log.info("client reports the tunnel disconnected")
+        return True
+
+    def _report_config(self):
+        if self.pid is None or self.established:
+            return False
+        dev = tun_device_of(self.pid) or self.tundev
+        try:
+            if not dev:
+                raise ConfigError("cannot find the tunnel device")
+            addrs = ip_json("-4", "addr", "show", "dev", dev)
+            addr_info = addrs[0].get("addr_info", []) if addrs else []
+            routes = ip_json("-4", "route", "show", "dev", dev)
+            mtu = addrs[0].get("mtu") if addrs else None
+            ip4 = build_ip4_config(addr_info, routes, self.dns, self.domains)
+        except (ConfigError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+            log.error("cannot read the tunnel configuration: %s", exc)
+            self.failure(NM.VpnPluginFailure.BAD_IP_CONFIG)
+            self.do_disconnect()
+            return False
+
+        config = {
+            NM.VPN_PLUGIN_CONFIG_TUNDEV: GLib.Variant("s", dev),
+            NM.VPN_PLUGIN_CONFIG_EXT_GATEWAY: GLib.Variant("u", ip4_u32(self.ext_gateway)),
+            NM.VPN_PLUGIN_CONFIG_HAS_IP4: GLib.Variant("b", True),
+            NM.VPN_PLUGIN_CONFIG_HAS_IP6: GLib.Variant("b", False),
+        }
+        if mtu:
+            config[NM.VPN_PLUGIN_CONFIG_MTU] = GLib.Variant("u", int(mtu))
+        self.established = True
+        log.info("tunnel up on %s (%d DNS server(s))", dev, len(self.dns))
+        self.set_config(GLib.Variant("a{sv}", config))
+        self.set_ip4_config(GLib.Variant("a{sv}", ip4))
+        return False
+
+    # -- cleanup ---------------------------------------------------------------
+
+    def _cleanup(self):
+        for source in self.watches.values():
+            GLib.source_remove(source)
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if self.rundir:
+            shutil.rmtree(self.rundir, ignore_errors=True)
+        self._reset()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--bus-name", default=SERVICE_NAME)
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        nm_level = int(os.environ.get("NM_VPN_LOG_LEVEL", "0"))
+    except ValueError:
+        nm_level = 0
+    debug = args.debug or nm_level >= 4
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO, stream=sys.stderr,
+                        format="nm-forcepoint[%(process)d]: %(levelname)s %(message)s")
+
+    plugin = ForcepointPlugin(service_name=args.bus_name, watch_peer=True)
+    try:
+        plugin.init(None)
+    except GLib.Error as exc:
+        log.error("cannot register %s on the system bus: %s", args.bus_name, exc.message)
+        return 1
+
+    loop = GLib.MainLoop()
+    plugin.connect("quit", lambda *_: loop.quit())
+
+    def on_signal(*_):
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, on_signal)
+    loop.run()
+    plugin.shutdown_sync()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

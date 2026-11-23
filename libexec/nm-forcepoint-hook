@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Run by forcepoint-client through --establishedcmd, --disconnectedcmd and
+# (as the "resolvectl" shim) --resolver. Forwards one line to the
+# nm-forcepoint service over the FIFO it created; does nothing otherwise.
+[ -n "$NM_FORCEPOINT_EVENTS" ] && [ -p "$NM_FORCEPOINT_EVENTS" ] || exit 0
+printf '%s\n' "$*" > "$NM_FORCEPOINT_EVENTS"
+exit 0
