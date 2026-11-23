@@ -26,9 +26,14 @@ activated. The service:
    address and routes, and reports them to NetworkManager;
 4. on disconnect, sends the client `SIGINT` so it tears the tunnel down itself.
 
+A GTK 3 settings page (`libnm-vpn-plugin-forcepoint-editor.so`) lets
+`nm-connection-editor` create and edit these connections.
+
 ## Requirements
 
 - NetworkManager with libnm (1.2 or newer), Python 3.9+, PyGObject, iproute2
+- to build the settings page: a C compiler, pkg-config, and the libnm and GTK 3
+  development files
 - `forcepoint-client` 2.x, found at `/usr/bin/_forcepoint-client` (the AUR
   `forcepoint-client-bin` package, whose bundled libevent is added to
   `LD_LIBRARY_PATH` automatically), `/usr/sbin/forcepoint-client` (the Debian
@@ -45,6 +50,7 @@ makepkg -si
 Anywhere else:
 
 ```sh
+make
 make test
 sudo make install            # PREFIX=/usr by default
 ```
@@ -69,7 +75,9 @@ sudo forcepoint-client -p 4443 vpn.example.org -u alice
 The client saves what it learned, including the gateway's CA, to
 `~/.config/forcepoint/sslvpn/<tunnel name>` (in your home when run with sudo).
 
-**2. Create the NetworkManager connection**, pointing `config` at that file:
+**2. Create the NetworkManager connection.** In `nm-connection-editor`, click
+**+**, choose **Forcepoint SSL VPN**, pick that file under **Saved config**
+and fill in your user name and password. Or with `nmcli`:
 
 ```sh
 nmcli connection add type vpn vpn-type forcepoint con-name work-vpn \
@@ -108,9 +116,8 @@ Secret (`vpn.secrets`): `password`.
 - **The password must be stored in the connection** (`password-flags=0`,
   "Store the password for all users"). libnm's Python bindings can't tell
   NetworkManager which secrets are missing, so the plugin can't prompt.
-- **No editor in nm-connection-editor yet.** Create and edit connections with
-  `nmcli`. They are listed and can be connected and disconnected from any
-  NetworkManager front end.
+- **The settings page is GTK 3**, for `nm-connection-editor`. GNOME Settings
+  (GTK 4) can connect and disconnect the VPN but not edit it.
 - **No two-factor challenge** (`--challengecmd`) support.
 - **IPv4 only.** IPv6 addresses sent by the gateway are ignored.
 

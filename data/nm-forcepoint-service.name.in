@@ -3,3 +3,6 @@ name=forcepoint
 service=org.freedesktop.NetworkManager.forcepoint
 program=@LIBEXECDIR@/nm-forcepoint-service
 supports-multiple-connections=false
+
+[libnm]
+plugin=@NMLIBDIR@/libnm-vpn-plugin-forcepoint-editor.so
