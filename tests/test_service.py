@@ -179,6 +179,47 @@ class Ip4Config(unittest.TestCase):
             svc.build_ip4_config([], [], [], [])
 
 
+class Resolved(unittest.TestCase):
+    def test_split_tunnel_commands(self):
+        self.assertEqual(svc.resolved_commands("tun0", ["10.0.0.1", "8.8.8.8"], ["corp.example"], False),
+                         [["dns", "tun0", "10.0.0.1", "8.8.8.8"],
+                          ["domain", "tun0", "corp.example"],
+                          ["default-route", "tun0", "false"]])
+
+    def test_full_tunnel_without_domains(self):
+        self.assertEqual(svc.resolved_commands("tun1", ["10.0.0.1"], [], True),
+                         [["dns", "tun1", "10.0.0.1"], ["default-route", "tun1", "true"]])
+
+    def test_nothing_without_servers(self):
+        self.assertEqual(svc.resolved_commands("tun0", [], ["corp.example"], False), [])
+
+
+class ErrorEnums(unittest.TestCase):
+    def test_enum_members_used_by_the_service_exist(self):
+        import re
+        with open(os.path.join(LIBEXEC, "nm-forcepoint-service")) as fh:
+            source = fh.read()
+        for name in set(re.findall(r"NM\.VpnPluginError\.([A-Z_]+)", source)):
+            self.assertTrue(hasattr(svc.NM.VpnPluginError, name), name)
+        for name in set(re.findall(r"NM\.VpnPluginFailure\.([A-Z_]+)", source)):
+            self.assertTrue(hasattr(svc.NM.VpnPluginFailure, name), name)
+
+
+class ErrorPropagation(unittest.TestCase):
+    def test_vpn_error_reaches_c_callers(self):
+        from gi.repository import Gio, GLib, GObject
+
+        class Raiser(GObject.Object, Gio.Initable):
+            def do_init(self, cancellable):
+                raise GLib.Error("no password stored", svc.VPN_ERROR_DOMAIN,
+                                 svc.NM.VpnPluginError.BADARGUMENTS)
+
+        with self.assertRaises(GLib.Error) as ctx:
+            Raiser().init(None)
+        self.assertTrue(ctx.exception.matches(svc.NM.VpnPluginError.quark(),
+                                              svc.NM.VpnPluginError.BADARGUMENTS))
+
+
 class Install(unittest.TestCase):
     def test_make_install_layout(self):
         root = os.path.dirname(HERE)

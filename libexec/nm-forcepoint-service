@@ -46,6 +46,9 @@ CLIENT_CANDIDATES = (
     ("/usr/bin/forcepoint-client", None),
 )
 
+# GLib.Error wants the domain as a string when it is handed back to C.
+VPN_ERROR_DOMAIN = GLib.quark_to_string(NM.VpnPluginError.quark())
+
 DISCONNECT_GRACE_S = 8
 ESTABLISH_SETTLE_MS = 700
 
@@ -207,6 +210,32 @@ def tun_device_of(pid):
     return None
 
 
+def resolved_commands(dev, dns, domains, full_tunnel):
+    """resolvectl calls that give the tunnel link its DNS in systemd-resolved.
+
+    NetworkManager treats the TUN device as externally managed (the client
+    configures it before NetworkManager hears about it) and does not push
+    DNS for external devices to systemd-resolved, so the service does it.
+    """
+    if not dns:
+        return []
+    cmds = [["dns", dev, *dns]]
+    if domains:
+        cmds.append(["domain", dev, *domains])
+    cmds.append(["default-route", dev, "true" if full_tunnel else "false"])
+    return cmds
+
+
+def apply_resolved(dev, dns, domains, full_tunnel):
+    resolvectl = shutil.which("resolvectl", path="/usr/bin:/bin:/usr/sbin:/sbin")
+    if not resolvectl or not os.path.exists("/run/systemd/resolve"):
+        return
+    for args in resolved_commands(dev, dns, domains, full_tunnel):
+        r = subprocess.run([resolvectl, *args], capture_output=True, text=True)
+        if r.returncode:
+            log.warning("resolvectl %s failed: %s", args[0], r.stderr.strip())
+
+
 def ip_json(*args):
     out = subprocess.run(["ip", "-j", *args], check=True, capture_output=True, text=True).stdout
     return json.loads(out or "[]")
@@ -276,6 +305,7 @@ class ForcepointPlugin(NM.VpnServicePlugin):
         self.dns = []
         self.domains = []
         self.ext_gateway = None
+        self.dns_enabled = True
         self.last_error = None
         self.cert_prompt_seen = False
 
@@ -289,8 +319,8 @@ class ForcepointPlugin(NM.VpnServicePlugin):
 
     def do_connect(self, connection):
         if self.pid is not None:
-            raise GLib.Error("a connection is already active", NM.VpnPluginError.quark(),
-                             NM.VpnPluginError.ALREADY_STARTED)
+            raise GLib.Error("a connection is already active", VPN_ERROR_DOMAIN,
+                             NM.VpnPluginError.ALREADYSTARTED)
         s_vpn = connection.get_setting_vpn()
         data = {k: s_vpn.get_data_item(k) for k in s_vpn.get_data_keys()}
         secrets = {k: s_vpn.get_secret(k) for k in s_vpn.get_secret_keys()}
@@ -300,9 +330,10 @@ class ForcepointPlugin(NM.VpnServicePlugin):
             self.ext_gateway = resolve_ipv4(opts["gateway"])
         except (ConfigError, OSError) as exc:
             log.error("connection settings: %s", exc)
-            raise GLib.Error(str(exc), NM.VpnPluginError.quark(),
-                             NM.VpnPluginError.BAD_ARGUMENTS) from None
+            raise GLib.Error(str(exc), VPN_ERROR_DOMAIN,
+                             NM.VpnPluginError.BADARGUMENTS) from None
 
+        self.dns_enabled = opts["dns"]
         self.rundir = tempfile.mkdtemp(prefix="nm-forcepoint-", dir="/run")
         fifo = os.path.join(self.rundir, "events")
         os.mkfifo(fifo, 0o600)
@@ -329,7 +360,7 @@ class ForcepointPlugin(NM.VpnServicePlugin):
         except GLib.Error as exc:
             self._cleanup()
             raise GLib.Error(f"cannot start forcepoint-client: {exc.message}",
-                             NM.VpnPluginError.quark(), NM.VpnPluginError.LAUNCH_FAILED) from None
+                             VPN_ERROR_DOMAIN, NM.VpnPluginError.LAUNCHFAILED) from None
         self.pid = pid
         for fd in (out_fd, err_fd):
             os.set_blocking(fd, False)
@@ -485,6 +516,9 @@ class ForcepointPlugin(NM.VpnServicePlugin):
         log.info("tunnel up on %s (%d DNS server(s))", dev, len(self.dns))
         self.set_config(GLib.Variant("a{sv}", config))
         self.set_ip4_config(GLib.Variant("a{sv}", ip4))
+        if self.dns_enabled:
+            full_tunnel = not ip4[NM.VPN_PLUGIN_IP4_CONFIG_NEVER_DEFAULT].unpack()
+            apply_resolved(dev, self.dns, self.domains, full_tunnel)
         return False
 
     # -- cleanup ---------------------------------------------------------------
@@ -530,8 +564,14 @@ def main():
         loop.quit()
         return GLib.SOURCE_REMOVE
 
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        signal_add = GLib.unix_signal_add
     for sig in (signal.SIGTERM, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, on_signal)
+        signal_add(GLib.PRIORITY_HIGH, sig, on_signal)
     loop.run()
     plugin.shutdown_sync()
     return 0

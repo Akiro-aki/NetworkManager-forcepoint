@@ -24,43 +24,97 @@ activated. The service:
    written to systemd-resolved behind NetworkManager's back;
 3. waits for the client's `--establishedcmd` hook, reads the TUN device, its
    address and routes, and reports them to NetworkManager;
-4. on disconnect, sends the client `SIGINT` so it tears the tunnel down itself.
+4. gives the tunnel's DNS servers and domains to systemd-resolved, since
+   NetworkManager does not do that for a TUN device the client configured
+   itself;
+5. on disconnect, sends the client `SIGINT` so it tears the tunnel down itself.
 
 A GTK 3 settings page (`libnm-vpn-plugin-forcepoint-editor.so`) lets
 `nm-connection-editor` create and edit these connections.
 
-## Requirements
+## Status
 
-- NetworkManager with libnm (1.2 or newer), Python 3.9+, PyGObject, iproute2
-- to build the settings page: a C compiler, pkg-config, and the libnm and GTK 3
-  development files
-- `forcepoint-client` 2.x, found at `/usr/bin/_forcepoint-client` (the AUR
-  `forcepoint-client-bin` package, whose bundled libevent is added to
-  `LD_LIBRARY_PATH` automatically), `/usr/sbin/forcepoint-client` (the Debian
-  package) or `/usr/bin/forcepoint-client`; or set `client=` yourself
+Early, but working: tested on Arch Linux with NetworkManager 1.58,
+forcepoint-client 2.5.2 and a split-tunnel gateway. Reports from other
+distributions and gateway setups are welcome.
 
-## Install
+## Installation
 
-Arch Linux:
+### 1. Install Forcepoint's client
+
+The plugin drives Forcepoint's own `forcepoint-client` 2.x; it does not
+include it. Get it from your organisation's IT department or Forcepoint's
+support site.
+
+- **Arch Linux:** the AUR package `forcepoint-client-bin`, e.g.
+  `yay -S forcepoint-client-bin`. It installs the client as
+  `/usr/bin/_forcepoint-client`; the plugin finds it and its bundled libevent
+  automatically.
+- **Debian / Ubuntu:** `sudo apt install ./forcepoint-client_*.deb`, which
+  installs `/usr/sbin/forcepoint-client`.
+- Anywhere else, set `client=` (and `library-path=` if needed) in the
+  connection's settings.
+
+### 2. Install the plugin
+
+Get the source:
+
+```sh
+git clone https://github.com/Akiro-aki/NetworkManager-forcepoint.git
+cd NetworkManager-forcepoint
+```
+
+**Arch Linux** (builds, runs the tests and installs a pacman package):
 
 ```sh
 makepkg -si
 ```
 
-Anywhere else:
+**Debian / Ubuntu:**
 
 ```sh
-make
-make test
-sudo make install            # PREFIX=/usr by default
+sudo apt install build-essential pkg-config libnm-dev libgtk-3-dev \
+                 python3-gi gir1.2-nm-1.0 iproute2
+make && make test
+sudo make install
 ```
 
-Then make D-Bus and NetworkManager notice the new files:
+**Fedora:**
+
+```sh
+sudo dnf install gcc make pkgconf-pkg-config NetworkManager-libnm-devel \
+                 gtk3-devel python3-gobject iproute
+make && make test
+sudo make install
+```
+
+`make install` takes the usual `PREFIX` (default `/usr`) and `DESTDIR`
+variables. NetworkManager only looks for VPN plugins under its own prefix, so
+keep `PREFIX=/usr` unless your NetworkManager lives elsewhere.
+
+### 3. Tell D-Bus and NetworkManager about it
+
+Needed once after the first install:
 
 ```sh
 sudo systemctl reload dbus
 sudo systemctl restart NetworkManager
 ```
+
+Restarting NetworkManager briefly drops your network connections.
+
+### Updating
+
+Pull and repeat step 2 (`git pull && makepkg -si`, or
+`git pull && make && sudo make install`). Reconnect the VPN to use the new
+version; restart `nm-connection-editor` if it is open.
+
+### Requirements
+
+- NetworkManager with libnm 1.2 or newer, Python 3.9+, PyGObject, iproute2
+- GTK 3, for the settings page in `nm-connection-editor`
+- to build: a C compiler, make, pkg-config, and the libnm and GTK 3
+  development files
 
 ## Set up a connection
 
@@ -132,7 +186,9 @@ The client's own output is logged with a `client:` prefix. For more detail:
 
 ## Uninstall
 
-`sudo pacman -R networkmanager-forcepoint`, or `sudo make uninstall`.
+`sudo pacman -R networkmanager-forcepoint` on Arch, or `sudo make uninstall`
+from the source folder elsewhere. Delete the connection first with
+`nmcli connection delete <name>`.
 
 ## License
 
